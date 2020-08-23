@@ -193,7 +193,10 @@ cd /var/www/html/bin
 
 fi
 
+php ./magento setup:static-content:deploy -f
 
 
 ./magento info:adminuri > /home/ec2-user/adminuri
+
+sudo service nginx restart
 
