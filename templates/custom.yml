@@ -1,0 +1,201 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Create Custom AMI of a running EC2 Instance
+
+Parameters:
+  AmazonLinuxAMI:
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: SSM parameter pointing to the desired Amazon Linux 2 AMI
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+  KeyPair:
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair.
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+    Type: AWS::EC2::KeyPair::KeyName
+  VPCID:
+    Description: VPC ID
+    Type: AWS::EC2::VPC::Id
+  WebServerInstanceType:
+    AllowedValues:
+    - t2.micro
+    - m4.large
+    ConstraintDescription: Choose an instance type.
+    Default: t2.micro
+    Description: Web Server node instance type
+    Type: String
+  WebServerSecurityGroup:
+    Description: Web Server Security Group
+    Type: List<AWS::EC2::SecurityGroup::Id>
+  WebServerSubnets:
+    ConstraintDescription: must be list of existing subnet Ids
+    Default: ''
+    Description: A list of subnet identifiers of Amazon VPCs where the WebServer Autoscaling
+      would be launched.
+    Type: List<AWS::EC2::Subnet::Id>
+Resources:
+
+  EDATestAMIWaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+  EDATestAMIWaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: EDATestAMI
+    Properties:
+      Handle: !Ref EDATestAMIWaitHandle
+      Timeout: '300'
+  EDATestAMI:
+    Type: AWS::EC2::Instance
+    Metadata:
+      'AWS::CloudFormation::Init':
+        config:
+          files:
+            /tmp/test.txt:
+              content: Hello World!
+              mode: '000755'
+              owner: root
+              group: root
+    Properties:
+      KeyName: !Ref KeyPair
+      ImageId: !Ref AmazonLinuxAMI
+      InstanceType: !Ref WebServerInstanceType
+      SubnetId:
+        !Select
+        - '0'
+        - !Ref WebServerSubnets
+      SecurityGroupIds:
+      - !Ref WebServerSecurityGroup
+      UserData:
+        !Base64
+          Fn::Sub: |
+            #!/bin/bash -xe
+            yum update -y aws-cfn-bootstrap
+            yum install httpd -y
+            service httpd start
+            chkconfig httpd on
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource EDATestAMI --region ${AWS::Region}
+            /opt/aws/bin/cfn-signal -e $? -d "`cat /etc/os-release`" -r "Build Process Complete" '${EDATestAMIWaitHandle}'
+      Tags:
+      - Key: Name
+        Value: Create Custom AMI
+
+  NewAMIInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      KeyName: !Ref KeyPair
+      ImageId: !GetAtt CreateAMI.ami
+      InstanceType: !Ref WebServerInstanceType
+      SubnetId:
+        !Select
+        - '0'
+        - !Ref WebServerSubnets
+      SecurityGroupIds:
+        - !Ref WebServerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: New AMI
+
+
+  AMIInfoFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - ec2:Describe*
+            - ec2:StopInstances
+            - ec2:CreateImage
+            - ec2:DeregisterImage
+            Resource: '*'
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  AMIInfoFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: python3.7
+      Timeout: 300
+      Role: !GetAtt AMIInfoFunctionExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import cfnresponse
+          import boto3
+          from random import randint
+          def lambda_handler(event, context):
+            if event['RequestType'] == 'Delete':
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              return
+            try:
+              ec2 = boto3.resource('ec2')
+              instance = ec2.Instance(event['ResourceProperties']['InstanceId'])
+              instance.stop()
+              instance.wait_until_stopped()
+              image = instance.create_image(Name="%s-%i" % (event['ResourceProperties']['AMIName'], randint(0,100000)), Description="Created with Cloudformation")
+              boto3.client('ec2').get_waiter('image_available').wait(ImageIds=[image.id])
+              responseData = {'ami':image.id}
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+            except Exception as inst:
+              print(inst)
+              cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  AMICleanUpFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: python3.7
+      Timeout: 300
+      Role: !GetAtt AMIInfoFunctionExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import cfnresponse
+          import boto3
+          from random import randint
+          def lambda_handler(event, context):
+            if event['RequestType'] == 'Delete':
+              try:
+                ec2 = boto3.resource('ec2')
+                image = ec2.Image(event['ResourceProperties']['AMIId'])
+                image.deregister()
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as inst:
+                print(inst)
+                cfnresponse.send(event, context, cfnresponse.FAILED, {})
+            else:
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+  CreateAMI:
+    Type: Custom::CreateAMI
+    DeletionPolicy: Retain
+    DependsOn: EDATestAMIWaitCondition
+    Properties:
+      ServiceToken: !GetAtt AMIInfoFunction.Arn
+      InstanceId: !Ref EDATestAMI
+      AMIName: EDATestAMI
+      Version: 1
+  CleanUpAMI:
+    Type: Custom::CleanUpAMI
+    Properties:
+      ServiceToken: !GetAtt AMICleanUpFunction.Arn
+      AMIId: !GetAtt CreateAMI.ami
+      Version: 1
+
+
+Outputs:
+  NewAMIId:
+    Description: Newly Created Custom AMI Id
+    Value: !GetAtt CreateAMI.ami
+  NewAMIInstanceId:
+    Description: Instance Id with new AMI
+    Value: !Ref NewAMIInstance
