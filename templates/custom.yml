@@ -27,7 +27,7 @@ Parameters:
   WebServerSubnets:
     ConstraintDescription: must be list of existing subnet Ids
     Default: ''
-    Description: A list of subnet identifiers of Amazon VPCs where the WebServer Autoscaling
+    Description: (Select 2 subnets) A list of subnet identifiers of Amazon VPCs where the WebServer Autoscaling
       would be launched.
     Type: List<AWS::EC2::Subnet::Id>
 Resources:
@@ -83,7 +83,7 @@ Resources:
       InstanceType: !Ref WebServerInstanceType
       SubnetId:
         !Select
-        - '0'
+        - '1'
         - !Ref WebServerSubnets
       SecurityGroupIds:
         - !Ref WebServerSecurityGroup
